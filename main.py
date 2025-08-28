@@ -562,16 +562,29 @@ class RadarSimulator:
                 self.work_state = RADAR_STATE_STANDBY
                 self._send_ack(msg_id, addr, seq, result=1)
             elif msg_id == CMD_SEARCH:
-                self.work_state = RADAR_STATE_SEARCH
-                self._send_ack(msg_id, addr, seq, result=1)
-                # 识别到动态目标后立刻上传一次航迹（此处进入搜索即视为可上报）
-                if self.targets:
-                    try:
-                        pkt = self._build_track_packet(self.targets[0])
-                        self.sock.sendto(pkt, addr)
-                        self.logger.info(f'Immediate TRACK packet sent (SEARCH) for track_id={self.targets[0].track_id} to {addr}')
-                    except Exception:
-                        self.logger.exception('Failed to send immediate TRACK packet on SEARCH')
+                # 按照表4.1.2: body 首字节为任务类型(uint8)，后续16字节保留
+                if len(body) >= 1:
+                    task_type = body[0]
+                    # 仅支持任务类型1作为有效的搜索任务
+                    if task_type == 1:
+                        self.work_state = RADAR_STATE_SEARCH
+                        self._send_ack(msg_id, addr, seq, result=1)
+                        self.logger.info(f'Enter SEARCH mode (task_type=1) from {addr}')
+                        # 进入搜索态后立即上传一次航迹（如有目标）
+                        if self.targets:
+                            try:
+                                pkt = self._build_track_packet(self.targets[0])
+                                self.sock.sendto(pkt, addr)
+                                self.logger.info(f'Immediate TRACK packet sent (SEARCH) for track_id={self.targets[0].track_id} to {addr}')
+                            except Exception:
+                                self.logger.exception('Failed to send immediate TRACK packet on SEARCH')
+                    else:
+                        # 不支持的 task_type，回复失败 ACK
+                        self.logger.warning(f'Unsupported SEARCH task_type={task_type} from {addr}')
+                        self._send_ack(msg_id, addr, seq, result=0)
+                else:
+                    self.logger.warning(f'SHORT SEARCH body from {addr}, len={len(body)}')
+                    self._send_ack(msg_id, addr, seq, result=0)
             elif msg_id == CMD_TRACK:
                 # 简化处理：切换状态为跟踪
                 self.work_state = RADAR_STATE_TRACK
