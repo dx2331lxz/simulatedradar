@@ -125,15 +125,53 @@ class SimTarget:
         self.lat = lat
         self.lon = lon
         self.alt = alt_m
+        self.base_alt = alt_m
         self.speed = speed_mps
         self.heading = heading_deg
         self.target_type = target_type  # 0未知,1旋翼无人机,2固定翼无人机...
         self.size = size  # 0小,1中,2大,3特大
         self.intensity = intensity_db
+        # 内部相位用于平滑起伏
+        self._phase = random.uniform(0.0, 6.28318)
 
-    def step(self, dt: float):
-        # 简单匀速直线，添加轻微随机摆动
-        self.heading = normalize_angle_deg(self.heading + random.uniform(-0.2, 0.2))
+    def step(self, dt: float, center_lat: float, center_lon: float, leash_m: float):
+        """不规则运动：随机游走 + 超出半径时朝中心回摆，保持高度轻微起伏。
+        - dt: 步长（秒）
+        - center_*: 雷达中心经纬
+        - leash_m: 目标允许离中心的最大半径（米）
+        """
+        # 速度轻微扰动并限幅
+        self.speed += random.uniform(-0.8, 0.8) * max(dt, 0.05)
+        self.speed = clamp(self.speed, 3.0, 25.0)
+
+        # 当前到中心的方位与距离（从目标->中心）
+        brg_to_center, dist_to_center = bearing_distance(self.lat, self.lon, center_lat, center_lon)
+
+        # 随机转向（度/秒），配合dt
+        drift = random.uniform(-15.0, 15.0) * dt
+
+        def angle_diff_deg(a: float, b: float) -> float:
+            d = (b - a + 180.0) % 360.0 - 180.0
+            return d
+
+        # 超出牵引半径则朝中心回摆，限制最大转向速率
+        if dist_to_center > leash_m:
+            corr = angle_diff_deg(self.heading, brg_to_center)
+            max_turn = 60.0 * dt  # 最大转向速率 60°/s
+            turn = clamp(corr, -max_turn, max_turn)
+            self.heading = normalize_angle_deg(self.heading + turn)
+            # 回摆时略微加速
+            self.speed = min(self.speed + 1.0, 25.0)
+        else:
+            # 在半径内随机游走
+            self.heading = normalize_angle_deg(self.heading + drift)
+
+        # 高度轻微起伏并限幅
+        self._phase += dt * 0.6
+        alt_jitter = math.sin(self._phase) * 0.5 + random.uniform(-0.3, 0.3)
+        self.alt = clamp(self.alt + alt_jitter, self.base_alt - 30.0, self.base_alt + 60.0)
+
+        # 按当前航向推进
         dist = self.speed * dt
         self.lat, self.lon = dest_from_bearing(self.lat, self.lon, self.heading, dist)
 
@@ -153,9 +191,10 @@ class RadarSimulator:
         device_id: int = DEFAULT_DEVICE_ID,
         status_hz: float = 50.0,
         send_tracks: bool = True,
-        track_hz: float = 5.0,
+    track_hz: float = 5.0,
     targets_count: int = 1,
     startup_state: str = 'standby',
+    leash_m: float = 2000.0,
     ):
         self.dest = (dest_ip, dest_port)
         self.bind = (bind_ip, bind_port)
@@ -213,6 +252,7 @@ class RadarSimulator:
         self.status_interval = 1.0 / status_hz if status_hz > 0 else 0
         self.track_interval = 1.0 / track_hz if track_hz > 0 else 0
         self.send_tracks = send_tracks
+        self.leash_m = float(leash_m)
 
         # 目标
         self.targets: List[SimTarget] = []
@@ -434,7 +474,7 @@ class RadarSimulator:
             if self.work_state in (RADAR_STATE_SEARCH, RADAR_STATE_TRACK):
                 # 目标推进
                 for t in self.targets:
-                    t.step(self.track_interval)
+                    t.step(self.track_interval, self.radar_lat, self.radar_lon, self.leash_m)
                     # 只要在静默区内则不发送
                     az_deg, dist_m = bearing_distance(self.radar_lat, self.radar_lon, t.lat, t.lon)
                     az100 = int(round(az_deg * 100.0))
@@ -605,7 +645,8 @@ def main():
     ap.add_argument('--status-hz', type=float, default=0.2, help='状态上报频率Hz（Hz，默认0.2，即每5秒上报一次）')
     ap.add_argument('--tracks-hz', type=float, default=5.0, help='航迹上报频率Hz')
     ap.add_argument('--no-tracks', action='store_true', help='不发送航迹')
-    ap.add_argument('--targets', type=int, default=1, help='启动时生成的目标数量（默认1）')
+    ap.add_argument('--targets', type=int, default=2, help='启动时生成的目标数量（默认2）')
+    ap.add_argument('--leash-m', type=float, default=5000.0, help='目标相对雷达允许的最大半径（米），超出将回摆')
     ap.add_argument('--startup-state', choices=['standby', 'search', 'track'], default='search', help='启动时的工作状态')
     args = ap.parse_args()
 
@@ -620,7 +661,8 @@ def main():
                          send_tracks=not args.no_tracks,
                          track_hz=args.tracks_hz,
                          targets_count=args.targets,
-                         startup_state=args.startup_state)
+                         startup_state=args.startup_state,
+                         leash_m=args.leash_m)
     print(f'Radar Simulator started. Send to {args.dest_ip}:{args.dest_port}, listen on {args.bind}:{args.bind_port}')
     print('Press Ctrl+C to stop.')
     sim.start()
