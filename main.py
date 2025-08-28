@@ -7,6 +7,7 @@ import time
 import random
 from typing import Tuple, List, Optional
 import logging
+from track_packet import build_track_body
 
 # =========================
 # 协议与常量
@@ -153,6 +154,8 @@ class RadarSimulator:
         status_hz: float = 50.0,
         send_tracks: bool = True,
         track_hz: float = 5.0,
+    targets_count: int = 1,
+    startup_state: str = 'standby',
     ):
         self.dest = (dest_ip, dest_port)
         self.bind = (bind_ip, bind_port)
@@ -167,7 +170,12 @@ class RadarSimulator:
         self.logger = logging.getLogger('RadarSimulator')
 
         # 雷达状态
-        self.work_state = RADAR_STATE_STANDBY
+        state_map = {
+            'standby': RADAR_STATE_STANDBY,
+            'search' : RADAR_STATE_SEARCH,
+            'track'  : RADAR_STATE_TRACK,
+        }
+        self.work_state = state_map.get(startup_state, RADAR_STATE_STANDBY)
         self.yaw = 0.0
         self.pitch = 0.0
         self.roll = 0.0
@@ -208,21 +216,26 @@ class RadarSimulator:
 
         # 目标
         self.targets: List[SimTarget] = []
-        if self.send_tracks:
-            # 默认1个小型旋翼无人机，速度15m/s，北向
-            self.targets.append(
-                SimTarget(
-                    track_id=1,
-                    lat=self.radar_lat + 0.002,
-                    lon=self.radar_lon + 0.002,
-                    alt_m=self.radar_alt + 120.0,
-                    speed_mps=15.0,
-                    heading_deg=0.0,
-                    target_type=1,
-                    size=0,
-                    intensity_db=25.0,
+        if self.send_tracks and targets_count > 0:
+            # 生成 N 个默认目标，环绕分布，速度与航向做轻微差异
+            for i in range(targets_count):
+                ang = (i * (360.0 / max(1, targets_count)))
+                # 每个目标相对雷达偏移约 ~200 米（约 0.0018 度纬度），经纬微调
+                dlat = 0.0018 * math.cos(math.radians(ang))
+                dlon = 0.0018 * math.sin(math.radians(ang))
+                self.targets.append(
+                    SimTarget(
+                        track_id=i + 1,
+                        lat=self.radar_lat + dlat,
+                        lon=self.radar_lon + dlon,
+                        alt_m=self.radar_alt + 100.0 + 5.0 * i,
+                        speed_mps=12.0 + (i % 3) * 3.0,
+                        heading_deg=(ang + 45.0) % 360.0,
+                        target_type=1,
+                        size=0,
+                        intensity_db=25.0,
+                    )
                 )
-            )
 
         # 线程
         self._stop = threading.Event()
@@ -361,10 +374,8 @@ class RadarSimulator:
         return b''.join(packed)
 
     def _build_track_packet(self, t: SimTarget) -> bytes:
-        # 头部 + 惯导有效 + 雷达经纬高 + 航迹信息*1 + 预留16
-        body = struct.pack('<Bddf', u8(self.inu_valid), float(self.radar_lon), float(self.radar_lat), float(self.radar_alt))
-        body += self._pack_track_info(t)
-        body += bytes(16)
+        # 头部 + 航迹报文体（见表22/表23）
+        body = build_track_body(self.inu_valid, self.radar_lon, self.radar_lat, self.radar_alt, t)
         header = self._build_header(MSG_TRACK, 0, total_len=32 + len(body) + 2)
         return self._finalize_packet(header, body)
 
@@ -513,10 +524,26 @@ class RadarSimulator:
             elif msg_id == CMD_SEARCH:
                 self.work_state = RADAR_STATE_SEARCH
                 self._send_ack(msg_id, addr, seq, result=1)
+                # 识别到动态目标后立刻上传一次航迹（此处进入搜索即视为可上报）
+                if self.targets:
+                    try:
+                        pkt = self._build_track_packet(self.targets[0])
+                        self.sock.sendto(pkt, addr)
+                        self.logger.info(f'Immediate TRACK packet sent (SEARCH) for track_id={self.targets[0].track_id} to {addr}')
+                    except Exception:
+                        self.logger.exception('Failed to send immediate TRACK packet on SEARCH')
             elif msg_id == CMD_TRACK:
                 # 简化处理：切换状态为跟踪
                 self.work_state = RADAR_STATE_TRACK
                 self._send_ack(msg_id, addr, seq, result=1)
+                # 切入跟踪态立刻上传一次航迹
+                if self.targets:
+                    try:
+                        pkt = self._build_track_packet(self.targets[0])
+                        self.sock.sendto(pkt, addr)
+                        self.logger.info(f'Immediate TRACK packet sent (TRACK) for track_id={self.targets[0].track_id} to {addr}')
+                    except Exception:
+                        self.logger.exception('Failed to send immediate TRACK packet on TRACK')
             elif msg_id == CFG_SILENT_SET:
                 # body: uint16 start, uint16 end, reserved...
                 if len(body) >= 4:
@@ -563,15 +590,23 @@ def main():
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
     ap = argparse.ArgumentParser(description='iEye 教育系列 雷达仿真器 (UDP)')
     ap.add_argument('--dest-ip', default='127.0.0.1', help='指挥中心IP')
-    ap.add_argument('--dest-port', type=int, default=int('0x1999', 16), help='指挥中心端口，默认0x1999')
+    def parse_port(s: str) -> int:
+        try:
+            return int(s, 0)  # 支持十进制或0x前缀
+        except Exception:
+            return int(s)
+
+    ap.add_argument('--dest-port', type=parse_port, default=int('0x1999', 16), help='指挥中心端口，支持十进制或0x前缀')
     ap.add_argument('--bind', default='0.0.0.0', help='本地绑定IP')
-    ap.add_argument('--bind-port', type=int, default=int('0x1888', 16), help='雷达本地端口，默认0x1888')
+    ap.add_argument('--bind-port', type=parse_port, default=int('0x1888', 16), help='雷达本地端口，支持十进制或0x前缀')
     ap.add_argument('--device-id', type=lambda x: int(x, 0), default=DEFAULT_DEVICE_ID, help='雷达设备ID（uint16）')
     ap.add_argument('--device-model', type=int, default=DEVICE_MODEL, help='设备型号')
     ap.add_argument('--check', type=int, choices=[0,1,2], default=DEFAULT_CHECK_MODE, help='校验模式：0无 1和校验 2CRC16')
     ap.add_argument('--status-hz', type=float, default=0.2, help='状态上报频率Hz（Hz，默认0.2，即每5秒上报一次）')
     ap.add_argument('--tracks-hz', type=float, default=5.0, help='航迹上报频率Hz')
     ap.add_argument('--no-tracks', action='store_true', help='不发送航迹')
+    ap.add_argument('--targets', type=int, default=1, help='启动时生成的目标数量（默认1）')
+    ap.add_argument('--startup-state', choices=['standby', 'search', 'track'], default='search', help='启动时的工作状态')
     args = ap.parse_args()
 
     sim = RadarSimulator(dest_ip=args.dest_ip,
@@ -583,7 +618,9 @@ def main():
                          device_id=args.device_id,
                          status_hz=args.status_hz,
                          send_tracks=not args.no_tracks,
-                         track_hz=args.tracks_hz)
+                         track_hz=args.tracks_hz,
+                         targets_count=args.targets,
+                         startup_state=args.startup_state)
     print(f'Radar Simulator started. Send to {args.dest_ip}:{args.dest_port}, listen on {args.bind}:{args.bind_port}')
     print('Press Ctrl+C to stop.')
     sim.start()
