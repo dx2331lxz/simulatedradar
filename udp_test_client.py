@@ -10,6 +10,7 @@ import time
 
 MAGIC = b'HRGK'
 CMD_SEARCH = 0x1004
+CMD_STANDBY = 0x1003
 
 
 def now_millis():
@@ -80,10 +81,18 @@ def main():
     ap.add_argument('--dest-port', type=lambda x: int(x, 0), default=0x1888)
     ap.add_argument('--timeout', type=float, default=2.0)
     ap.add_argument('--seq', type=int, default=5)
+    ap.add_argument('--msg-id', type=lambda x: int(x, 0), default=CMD_SEARCH, help='要发送的消息ID（例如 0x1004 搜索，0x1003 待机）')
+    ap.add_argument('--task-type', type=lambda x: int(x, 0), help='任务类型：搜索1，待机0；不传则 body 为空用于兼容测试')
     args = ap.parse_args()
 
-    pkt = build_packet(CMD_SEARCH, body=b'', check_mode=2, seq=args.seq)
-    print(f'Sending CMD_SEARCH (seq={args.seq}) to {args.dest_ip}:{args.dest_port}, packet len={len(pkt)}')
+    if args.task_type is None:
+        body = b''  # 兼容仅有命令头的情况
+    else:
+        # 1字节 task_type + 16字节保留
+        body = bytes([args.task_type & 0xFF]) + bytes(16)
+
+    pkt = build_packet(args.msg_id, body=body, check_mode=2, seq=args.seq)
+    print(f'Sending msg_id=0x{args.msg_id:04X} (seq={args.seq}, body_len={len(body)}) to {args.dest_ip}:{args.dest_port}, packet len={len(pkt)}')
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(args.timeout)

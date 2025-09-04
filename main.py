@@ -538,8 +538,10 @@ class RadarSimulator:
             if magic != MAGIC:
                 continue
             if total_len != len(data):
-                # 长度不符，忽略
-                continue
+                # 长度字段与实际收到的数据长度不一致，之前策略是直接丢弃。
+                # 改为记录警告并继续处理（在许多测试客户端中 total_len 计算/填充不严格，
+                # 导致仿真器无响应），以便能更宽容地兼容测试工具并输出诊断信息。
+                self.logger.warning(f'Header total_len mismatch from {addr}: header={total_len} actual={len(data)} -- will continue processing for diagnostics')
             # 验证校验
             if chk_mode == 2:
                 expect = struct.unpack('<H', data[-2:])[0]
@@ -559,31 +561,55 @@ class RadarSimulator:
             body = data[32:-2] if len(data) >= 34 else b''
 
             if msg_id == CMD_STANDBY:
-                self.work_state = RADAR_STATE_STANDBY
-                self._send_ack(msg_id, addr, seq, result=1)
+                # 表13：body 首字节为任务类型(uint8)，默认0；后续16字节保留
+                self.logger.debug(f'STANDBY body len={len(body)} from {addr} data={body.hex()}')
+                if len(body) == 0:
+                    task_type = 0
+                    self.logger.info(f'Empty STANDBY body received from {addr}, defaulting task_type=0')
+                elif len(body) >= 1:
+                    task_type = body[0]
+                else:
+                    self.logger.warning(f'SHORT STANDBY body from {addr}, len={len(body)}')
+                    self._send_ack(msg_id, addr, seq, result=0)
+                    continue
+
+                if task_type == 0:
+                    self.work_state = RADAR_STATE_STANDBY
+                    self._send_ack(msg_id, addr, seq, result=1)
+                    self.logger.info(f'Enter STANDBY mode (task_type=0) from {addr}; track sending will stop')
+                else:
+                    self.logger.warning(f'Unsupported STANDBY task_type={task_type} from {addr}')
+                    self._send_ack(msg_id, addr, seq, result=0)
             elif msg_id == CMD_SEARCH:
                 # 按照表4.1.2: body 首字节为任务类型(uint8)，后续16字节保留
-                if len(body) >= 1:
+                self.logger.debug(f'SEARCH body len={len(body)} from {addr} data={body.hex()}')
+                # 先解析或推断 task_type（兼容性：空 body 视作 task_type=1）
+                if len(body) == 0:
+                    task_type = 1
+                    self.logger.info(f'Empty SEARCH body received from {addr}, defaulting task_type=1')
+                elif len(body) >= 1:
                     task_type = body[0]
-                    # 仅支持任务类型1作为有效的搜索任务
-                    if task_type == 1:
-                        self.work_state = RADAR_STATE_SEARCH
-                        self._send_ack(msg_id, addr, seq, result=1)
-                        self.logger.info(f'Enter SEARCH mode (task_type=1) from {addr}')
-                        # 进入搜索态后立即上传一次航迹（如有目标）
-                        if self.targets:
-                            try:
-                                pkt = self._build_track_packet(self.targets[0])
-                                self.sock.sendto(pkt, addr)
-                                self.logger.info(f'Immediate TRACK packet sent (SEARCH) for track_id={self.targets[0].track_id} to {addr}')
-                            except Exception:
-                                self.logger.exception('Failed to send immediate TRACK packet on SEARCH')
-                    else:
-                        # 不支持的 task_type，回复失败 ACK
-                        self.logger.warning(f'Unsupported SEARCH task_type={task_type} from {addr}')
-                        self._send_ack(msg_id, addr, seq, result=0)
                 else:
                     self.logger.warning(f'SHORT SEARCH body from {addr}, len={len(body)}')
+                    self._send_ack(msg_id, addr, seq, result=0)
+                    continue
+
+                # 仅支持任务类型1作为有效的搜索任务
+                if task_type == 1:
+                    self.work_state = RADAR_STATE_SEARCH
+                    self._send_ack(msg_id, addr, seq, result=1)
+                    self.logger.info(f'Enter SEARCH mode (task_type=1) from {addr}')
+                    # 进入搜索态后立即上传一次航迹（如有目标）
+                    if self.targets:
+                        try:
+                            pkt = self._build_track_packet(self.targets[0])
+                            self.sock.sendto(pkt, addr)
+                            self.logger.info(f'Immediate TRACK packet sent (SEARCH) for track_id={self.targets[0].track_id} to {addr}')
+                        except Exception:
+                            self.logger.exception('Failed to send immediate TRACK packet on SEARCH')
+                else:
+                    # 不支持的 task_type，回复失败 ACK
+                    self.logger.warning(f'Unsupported SEARCH task_type={task_type} from {addr}')
                     self._send_ack(msg_id, addr, seq, result=0)
             elif msg_id == CMD_TRACK:
                 # 简化处理：切换状态为跟踪
@@ -660,7 +686,7 @@ def main():
     ap.add_argument('--no-tracks', action='store_true', help='不发送航迹')
     ap.add_argument('--targets', type=int, default=2, help='启动时生成的目标数量（默认2）')
     ap.add_argument('--leash-m', type=float, default=5000.0, help='目标相对雷达允许的最大半径（米），超出将回摆')
-    ap.add_argument('--startup-state', choices=['standby', 'search', 'track'], default='search', help='启动时的工作状态')
+    ap.add_argument('--startup-state', choices=['standby', 'search', 'track'], default='standby', help='启动时的工作状态')
     args = ap.parse_args()
 
     sim = RadarSimulator(dest_ip=args.dest_ip,
