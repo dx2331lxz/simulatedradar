@@ -31,6 +31,7 @@ MSG_QUERY = 0xF001
 CMD_STANDBY = 0x1003
 CMD_SEARCH = 0x1004
 CMD_TRACK = 0x1005
+CMD_DEPLOY = 0x1008  # 展开/撤收任务
 
 CFG_SILENT_SET = 0x2091
 CFG_SILENT_FEEDBACK = 0x2092
@@ -193,7 +194,7 @@ class RadarSimulator:
         send_tracks: bool = True,
     track_hz: float = 5.0,
     targets_count: int = 1,
-    startup_state: str = 'standby',
+    startup_state: str = 'retract',
     leash_m: float = 2000.0,
     ):
         self.dest = (dest_ip, dest_port)
@@ -213,6 +214,7 @@ class RadarSimulator:
             'standby': RADAR_STATE_STANDBY,
             'search' : RADAR_STATE_SEARCH,
             'track'  : RADAR_STATE_TRACK,
+            'retract': RADAR_STATE_STANDBY,
         }
         self.work_state = state_map.get(startup_state, RADAR_STATE_STANDBY)
         self.yaw = 0.0
@@ -225,6 +227,14 @@ class RadarSimulator:
         self.sim_mode = 0
         self.retract_state = 0
         self.drive_state = 0
+        # 电子锁（True=锁定，False=解锁）
+        self.electronic_lock = True
+
+        # 如果以 'retract' 启动，则设置为撤收态（回转台0、上锁）
+        if startup_state == 'retract':
+            self.retract_state = 1
+            self.electronic_lock = True
+            self.yaw = 0.0
 
         # 地理位置（可根据需要设置）
         self.radar_lon = 116.3913
@@ -636,6 +646,49 @@ class RadarSimulator:
                 except Exception:
                     self.logger.exception('Failed to send CFG_SILENT_FEEDBACK')
                     pass
+            elif msg_id == CMD_DEPLOY:
+                # 表17：body 首字节为任务类型(uint8)，0x01 展开，0x00 撤收，后续16字节保留
+                self.logger.debug(f'DEPLOY body len={len(body)} from {addr} data={body.hex()}')
+                if len(body) == 0:
+                    task_type = 0
+                    self.logger.info(f'Empty DEPLOY body received from {addr}, defaulting task_type=0 (retract)')
+                elif len(body) >= 1:
+                    task_type = body[0]
+                else:
+                    self.logger.warning(f'SHORT DEPLOY body from {addr}, len={len(body)}')
+                    self._send_ack(msg_id, addr, seq, result=0)
+                    continue
+
+                if task_type == 1:
+                    # 展开：解锁转台电子锁
+                    self.electronic_lock = False
+                    self.retract_state = 0
+                    self._send_ack(msg_id, addr, seq, result=1)
+                    self.logger.info(f'DEPLOY: expand received from {addr}, electronic_lock=UNLOCKED')
+                    # 发送一次状态包以反馈当前状态
+                    try:
+                        pkt = self._build_status_packet()
+                        self.sock.sendto(pkt, addr)
+                        self.logger.info(f'Sent STATUS packet (deploy expand) to {addr} len={len(pkt)}')
+                    except Exception:
+                        self.logger.exception('Failed to send STATUS packet after DEPLOY expand')
+                elif task_type == 0:
+                    # 撤收：置为待机，转台回0位，并上锁
+                    self.work_state = RADAR_STATE_STANDBY
+                    self.yaw = 0.0
+                    self.electronic_lock = True
+                    self.retract_state = 1
+                    self._send_ack(msg_id, addr, seq, result=1)
+                    self.logger.info(f'DEPLOY: retract received from {addr}, electronic_lock=LOCKED, yaw reset to 0, state=STANDBY')
+                    try:
+                        pkt = self._build_status_packet()
+                        self.sock.sendto(pkt, addr)
+                        self.logger.info(f'Sent STATUS packet (deploy retract) to {addr} len={len(pkt)}')
+                    except Exception:
+                        self.logger.exception('Failed to send STATUS packet after DEPLOY retract')
+                else:
+                    self.logger.warning(f'Unsupported DEPLOY task_type={task_type} from {addr}')
+                    self._send_ack(msg_id, addr, seq, result=0)
             elif msg_id == MSG_QUERY:
                 # 参数查询：body前2字节为待查询报文ID
                 if len(body) >= 2:
@@ -686,7 +739,7 @@ def main():
     ap.add_argument('--no-tracks', action='store_true', help='不发送航迹')
     ap.add_argument('--targets', type=int, default=2, help='启动时生成的目标数量（默认2）')
     ap.add_argument('--leash-m', type=float, default=5000.0, help='目标相对雷达允许的最大半径（米），超出将回摆')
-    ap.add_argument('--startup-state', choices=['standby', 'search', 'track'], default='standby', help='启动时的工作状态')
+    ap.add_argument('--startup-state', choices=['standby', 'search', 'track', 'retract'], default='retract', help='启动时的工作状态')
     args = ap.parse_args()
 
     sim = RadarSimulator(dest_ip=args.dest_ip,
