@@ -340,6 +340,57 @@ class RadarSimulator:
     def enable_bulk_report(self, enable: bool):
         self.bulk_report = bool(enable)
 
+    # ============== 目标生成/替换 ==============
+    def _create_new_target(self) -> SimTarget:
+        """创建一个新的目标，位置随机落在探测距离边缘附近，朝中心略带抖动地飞行。"""
+        edge_limit = float(self.detect_range_m)  # 跟随探测距离动态变化
+        ang = random.uniform(0.0, 360.0)
+        dist = random.uniform(max(0.0, edge_limit - 50.0), edge_limit)
+        lat, lon = dest_from_bearing(self.radar_lat, self.radar_lon, ang, dist)
+
+        heading_to_center = bearing_distance(lat, lon, self.radar_lat, self.radar_lon)[0]
+        init_heading = normalize_angle_deg(heading_to_center + random.uniform(-10.0, 10.0))
+
+        ttype = random.choice([0x00, 0x01, 0x02, 0x03, 0x04, 0x05])
+        init_speed = sample_speed_for_type(ttype)
+        size = random.choice([0x00, 0x01, 0x02, 0x03])
+
+        track_id = self.next_track_id
+        self.next_track_id += 1
+
+        return SimTarget(
+            track_id=track_id,
+            lat=lat,
+            lon=lon,
+            alt_m=self.radar_alt + 100.0 + random.uniform(-5.0, 5.0),
+            speed_mps=init_speed,
+            heading_deg=init_heading,
+            target_type=ttype,
+            size=size,
+            intensity_db=25.0,
+        )
+
+    def _respawn_out_of_range(self, threshold_m: Optional[float] = None):
+        """将超出探测距离+500m的目标清除并生成新目标替换，保持目标数量不变。"""
+        if threshold_m is None:
+            threshold_m = float(self.detect_range_m) + 500.0  # 默认使用当前探测距离+500m
+        if not self.targets:
+            return
+        new_list: List[SimTarget] = []
+        replaced = 0
+        for t in list(self.targets):
+            _, dist_m = bearing_distance(self.radar_lat, self.radar_lon, t.lat, t.lon)
+            if dist_m > threshold_m:
+                replaced += 1
+                nt = self._create_new_target()
+                new_list.append(nt)
+                self.logger.info(f'Target track_id={t.track_id} out of {threshold_m:.0f}m, removed. New track_id={nt.track_id}.')
+            else:
+                new_list.append(t)
+        if replaced:
+            with self.lock:
+                self.targets = new_list
+
     # ============== 打包帧头与报文 ==============
 
     def _build_header(self, msg_id: int, ext_msg_id: int, total_len: int, seq: Optional[int] = None) -> bytes:
@@ -543,14 +594,8 @@ class RadarSimulator:
                 # 目标推进
                 for t in self.targets:
                     t.step(self.track_interval, self.radar_lat, self.radar_lon, self.leash_m)
-                    # 只要在静默区内则不发送
-                    az_deg, dist_m = bearing_distance(self.radar_lat, self.radar_lon, t.lat, t.lon)
-                    az100 = int(round(az_deg * 100.0))
-                    if self._in_silent_zone(az100):
-                        continue
-                    # 如果启用批量上报，则在循环外统一发送
-                    # 单目标发送留到后续处理
-                    pass
+                # 超出探测距离+500m的目标重生，确保后续不上报越界目标
+                self._respawn_out_of_range()
 
                 if self.bulk_report:
                     # 收集非静默目标
@@ -606,6 +651,8 @@ class RadarSimulator:
                         t.step(move_dt, self.radar_lat, self.radar_lon, self.leash_m)
                     except Exception:
                         self.logger.exception('Error while moving target')
+                # 超出探测距离+500m的目标重生
+                self._respawn_out_of_range()
             next_t += move_dt
             sleep_t = next_t - time.time()
             if sleep_t > 0:
