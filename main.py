@@ -155,16 +155,27 @@ class SimTarget:
             d = (b - a + 180.0) % 360.0 - 180.0
             return d
 
-        # 超出牵引半径则朝中心回摆，限制最大转向速率
-        if dist_to_center > leash_m:
-            corr = angle_diff_deg(self.heading, brg_to_center)
-            max_turn = 60.0 * dt  # 最大转向速率 60°/s
+        # 当接近或超出牵引半径时，强制或偏向朝中心回摆，避免继续向外运动
+        # 如果在边缘附近（>= 85% leash），优先指向中心（带少量抖动）
+        if dist_to_center >= leash_m * 0.85:
+            # 直接将航向偏向指向中心，加入小幅随机抖动
+            preferred = brg_to_center + random.uniform(-5.0, 5.0)
+            # 平滑过渡：限制每步最大转角
+            max_turn = 60.0 * dt
+            corr = angle_diff_deg(self.heading, preferred)
             turn = clamp(corr, -max_turn, max_turn)
             self.heading = normalize_angle_deg(self.heading + turn)
-            # 回摆时略微加速
+            # 回摆时略微加速以更快回到半径内
             self.speed = min(self.speed + 1.0, 25.0)
+        elif dist_to_center > leash_m:
+            # 超出牵引半径（极端情况），更强力回摆
+            corr = angle_diff_deg(self.heading, brg_to_center)
+            max_turn = 120.0 * dt
+            turn = clamp(corr, -max_turn, max_turn)
+            self.heading = normalize_angle_deg(self.heading + turn)
+            self.speed = min(self.speed + 2.0, 25.0)
         else:
-            # 在半径内随机游走
+            # 在半径内随机游走，但仍稍微倾向保持当前航向
             self.heading = normalize_angle_deg(self.heading + drift)
 
         # 高度轻微起伏并限幅
@@ -271,11 +282,15 @@ class RadarSimulator:
         # always create targets when requested (even if we might not send track packets)
         if targets_count > 0:
             for i in range(targets_count):
-                # random bearing and distance within a reasonable radius around the radar
+                # place targets near the 5km edge (or leash limit if smaller)
                 ang = random.uniform(0.0, 360.0)
-                max_dist = min(1000.0, float(self.leash_m) * 0.5)
-                dist = random.uniform(50.0, max_dist)
+                edge_dist = min(float(self.leash_m), 5000.0)
+                # put target close to the edge within ~50m inward jitter (4950-5000m)
+                dist = random.uniform(max(0.0, edge_dist - 50.0), edge_dist)
                 lat, lon = dest_from_bearing(self.radar_lat, self.radar_lon, ang, dist)
+                # initial heading: point toward radar center with small jitter
+                heading_to_center = bearing_distance(lat, lon, self.radar_lat, self.radar_lon)[0]
+                init_heading = normalize_angle_deg(heading_to_center + random.uniform(-10.0, 10.0))
                 self.targets.append(
                     SimTarget(
                         track_id=i + 1,
@@ -283,8 +298,8 @@ class RadarSimulator:
                         lon=lon,
                         alt_m=self.radar_alt + 100.0 + random.uniform(-5.0, 5.0) + 5.0 * i,
                         speed_mps=12.0 + (i % 3) * 3.0 + random.uniform(-2.0, 2.0),
-                        heading_deg=random.uniform(0.0, 360.0),
-                        target_type=random.choice([0x01, 0x02, 0x03, 0x04, 0x05]),
+                        heading_deg=init_heading,
+                        target_type=random.choice([0x00, 0x01, 0x02, 0x03, 0x04, 0x05]),
                         size=random.choice([0x00, 0x01, 0x02, 0x03]),
                         intensity_db=25.0,
                     )
