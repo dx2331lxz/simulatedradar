@@ -148,35 +148,9 @@ class SimTarget:
         # 当前到中心的方位与距离（从目标->中心）
         brg_to_center, dist_to_center = bearing_distance(self.lat, self.lon, center_lat, center_lon)
 
-        # 随机转向（度/秒），配合dt
+        # 随机转向（度/秒），配合dt —— 自由游走，不在边缘强制回摆
         drift = random.uniform(-15.0, 15.0) * dt
-
-        def angle_diff_deg(a: float, b: float) -> float:
-            d = (b - a + 180.0) % 360.0 - 180.0
-            return d
-
-        # 当接近或超出牵引半径时，强制或偏向朝中心回摆，避免继续向外运动
-        # 如果在边缘附近（>= 85% leash），优先指向中心（带少量抖动）
-        if dist_to_center >= leash_m * 0.85:
-            # 直接将航向偏向指向中心，加入小幅随机抖动
-            preferred = brg_to_center + random.uniform(-5.0, 5.0)
-            # 平滑过渡：限制每步最大转角
-            max_turn = 60.0 * dt
-            corr = angle_diff_deg(self.heading, preferred)
-            turn = clamp(corr, -max_turn, max_turn)
-            self.heading = normalize_angle_deg(self.heading + turn)
-            # 回摆时略微加速以更快回到半径内
-            self.speed = min(self.speed + 1.0, 25.0)
-        elif dist_to_center > leash_m:
-            # 超出牵引半径（极端情况），更强力回摆
-            corr = angle_diff_deg(self.heading, brg_to_center)
-            max_turn = 120.0 * dt
-            turn = clamp(corr, -max_turn, max_turn)
-            self.heading = normalize_angle_deg(self.heading + turn)
-            self.speed = min(self.speed + 2.0, 25.0)
-        else:
-            # 在半径内随机游走，但仍稍微倾向保持当前航向
-            self.heading = normalize_angle_deg(self.heading + drift)
+        self.heading = normalize_angle_deg(self.heading + drift)
 
         # 高度轻微起伏并限幅
         self._phase += dt * 0.6
@@ -304,6 +278,9 @@ class RadarSimulator:
                         intensity_db=25.0,
                     )
                 )
+
+        # 下一个可用 track id
+        self.next_track_id = targets_count + 1
 
         # continuous movement thread (targets move regardless of SEARCH/TRACK state)
         self.t_move = threading.Thread(target=self._move_loop, daemon=True)
