@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 import struct
-from typing import Protocol
+from typing import Protocol, List
 
 
 class _TargetLike(Protocol):
@@ -129,5 +129,28 @@ def build_track_body(
     """
     body = struct.pack('<Bddf', _u8(inu_valid), float(radar_lon), float(radar_lat), float(radar_alt))
     body += pack_track_info(radar_lat, radar_lon, radar_alt, t)
+    body += bytes(16)
+    return body
+
+
+def build_tracks_body(
+    inu_valid: int,
+    radar_lon: float,
+    radar_lat: float,
+    radar_alt: float,
+    targets: List[_TargetLike],
+) -> bytes:
+    """
+    构建包含多个航迹信息（表23）的航迹报文体：
+      uint8 惯导有效
+      double 雷达经度
+      double 雷达纬度
+      float  雷达海拔
+      航迹信息 * N
+      预留 uint8[16]
+    """
+    body = struct.pack('<Bddf', _u8(inu_valid), float(radar_lon), float(radar_lat), float(radar_alt))
+    for t in targets:
+        body += pack_track_info(radar_lat, radar_lon, radar_alt, t)
     body += bytes(16)
     return body

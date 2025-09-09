@@ -262,36 +262,45 @@ class RadarSimulator:
         self.status_interval = 1.0 / status_hz if status_hz > 0 else 0
         self.track_interval = 1.0 / track_hz if track_hz > 0 else 0
         self.send_tracks = send_tracks
+        self.bulk_report = False
         self.leash_m = float(leash_m)
 
         # 目标
         self.targets: List[SimTarget] = []
-        if self.send_tracks and targets_count > 0:
-            # 生成 N 个默认目标，环绕分布，速度与航向做轻微差异
+        # \u76ee\u6807 (\u521d\u59cb\u4f4d\u7f6e\u6216\u8005\u663e\u793a\u4f4d\u7f6e\u53ef\u4e3a\u968f\u673a)
+        # always create targets when requested (even if we might not send track packets)
+        if targets_count > 0:
             for i in range(targets_count):
-                ang = (i * (360.0 / max(1, targets_count)))
-                # 每个目标相对雷达偏移约 ~200 米（约 0.0018 度纬度），经纬微调
-                dlat = 0.0018 * math.cos(math.radians(ang))
-                dlon = 0.0018 * math.sin(math.radians(ang))
+                # random bearing and distance within a reasonable radius around the radar
+                ang = random.uniform(0.0, 360.0)
+                max_dist = min(1000.0, float(self.leash_m) * 0.5)
+                dist = random.uniform(50.0, max_dist)
+                lat, lon = dest_from_bearing(self.radar_lat, self.radar_lon, ang, dist)
                 self.targets.append(
                     SimTarget(
                         track_id=i + 1,
-                        lat=self.radar_lat + dlat,
-                        lon=self.radar_lon + dlon,
-                        alt_m=self.radar_alt + 100.0 + 5.0 * i,
-                        speed_mps=12.0 + (i % 3) * 3.0,
-                        heading_deg=(ang + 45.0) % 360.0,
-                        target_type=1,
-                        size=0,
+                        lat=lat,
+                        lon=lon,
+                        alt_m=self.radar_alt + 100.0 + random.uniform(-5.0, 5.0) + 5.0 * i,
+                        speed_mps=12.0 + (i % 3) * 3.0 + random.uniform(-2.0, 2.0),
+                        heading_deg=random.uniform(0.0, 360.0),
+                        target_type=random.choice([0x01, 0x02, 0x03, 0x04, 0x05]),
+                        size=random.choice([0x00, 0x01, 0x02, 0x03]),
                         intensity_db=25.0,
                     )
                 )
+
+        # continuous movement thread (targets move regardless of SEARCH/TRACK state)
+        self.t_move = threading.Thread(target=self._move_loop, daemon=True)
 
         # 线程
         self._stop = threading.Event()
         self.t_rx = threading.Thread(target=self._rx_loop, daemon=True)
         self.t_status = threading.Thread(target=self._status_loop, daemon=True)
         self.t_track = threading.Thread(target=self._track_loop, daemon=True)
+
+    def enable_bulk_report(self, enable: bool):
+        self.bulk_report = bool(enable)
 
     # ============== 打包帧头与报文 ==============
 
@@ -447,6 +456,10 @@ class RadarSimulator:
         if self.send_tracks and self.track_interval > 0:
             self.t_track.start()
             self.logger.info('Track thread started')
+        # always start movement thread so targets move from program start
+        if self.targets:
+            self.t_move.start()
+            self.logger.info('Move thread started')
 
     def stop(self):
         self._stop.set()
@@ -454,6 +467,13 @@ class RadarSimulator:
             self.sock.close()
         except Exception:
             pass
+        # join move thread briefly if running
+        try:
+            if hasattr(self, 't_move') and self.t_move.is_alive():
+                self.t_move.join(timeout=0.5)
+        except Exception:
+            pass
+
 
     def _status_loop(self):
         next_t = time.time()
@@ -490,14 +510,65 @@ class RadarSimulator:
                     az100 = int(round(az_deg * 100.0))
                     if self._in_silent_zone(az100):
                         continue
-                    pkt = self._build_track_packet(t)
-                    try:
-                        self.sock.sendto(pkt, self.dest)
-                        self.logger.info(f'Sent TRACK packet for track_id={t.track_id} {len(pkt)} bytes to {self.dest}')
-                    except Exception:
-                        self.logger.exception('Failed to send TRACK packet')
-                        pass
+                    # 如果启用批量上报，则在循环外统一发送
+                    # 单目标发送留到后续处理
+                    pass
+
+                if self.bulk_report:
+                    # 收集非静默目标
+                    from track_packet import build_tracks_body
+                    visible = []
+                    for t in self.targets:
+                        az_deg, dist_m = bearing_distance(self.radar_lat, self.radar_lon, t.lat, t.lon)
+                        az100 = int(round(az_deg * 100.0))
+                        if not self._in_silent_zone(az100):
+                            visible.append(t)
+                    if visible:
+                        body = build_tracks_body(self.inu_valid, self.radar_lon, self.radar_lat, self.radar_alt, visible)
+                        header = self._build_header(MSG_TRACK, 0, total_len=32 + len(body) + 2)
+                        pkt = self._finalize_packet(header, body)
+                        try:
+                            self.sock.sendto(pkt, self.dest)
+                            self.logger.info(f'Sent BULK TRACK packet with {len(visible)} tracks {len(pkt)} bytes to {self.dest}')
+                        except Exception:
+                            self.logger.exception('Failed to send BULK TRACK packet')
+                            pass
+                else:
+                    # 单目标逐个发送（保持原行为）
+                    for t in self.targets:
+                        az_deg, dist_m = bearing_distance(self.radar_lat, self.radar_lon, t.lat, t.lon)
+                        az100 = int(round(az_deg * 100.0))
+                        if self._in_silent_zone(az100):
+                            continue
+                        pkt = self._build_track_packet(t)
+                        try:
+                            self.sock.sendto(pkt, self.dest)
+                            self.logger.info(f'Sent TRACK packet for track_id={t.track_id} {len(pkt)} bytes to {self.dest}')
+                        except Exception:
+                            self.logger.exception('Failed to send TRACK packet')
+                            pass
             next_t += self.track_interval
+            sleep_t = next_t - time.time()
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+            else:
+                next_t = time.time()
+
+    def _move_loop(self):
+        """Continuously advance all targets regardless of radar state.
+        Runs at a fixed small timestep to make motion smooth.
+        """
+        move_hz = 10.0
+        move_dt = 1.0 / move_hz
+        next_t = time.time()
+        while not self._stop.is_set():
+            if self.targets:
+                for t in self.targets:
+                    try:
+                        t.step(move_dt, self.radar_lat, self.radar_lon, self.leash_m)
+                    except Exception:
+                        self.logger.exception('Error while moving target')
+            next_t += move_dt
             sleep_t = next_t - time.time()
             if sleep_t > 0:
                 time.sleep(sleep_t)
