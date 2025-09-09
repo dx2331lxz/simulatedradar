@@ -76,6 +76,24 @@ def normalize_angle_deg(a):
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
+
+def speed_range_for_type(t: int):
+    """返回目标类型对应的速度区间 (min, max) m/s。"""
+    mapping = {
+        0: (0.0, 400.0),
+        1: (0.0, 25.0),
+        2: (10.0, 60.0),
+        3: (30.0, 120.0),
+        4: (10.0, 80.0),
+        5: (100.0, 250.0),
+    }
+    return mapping.get(t, (0.0, 400.0))
+
+
+def sample_speed_for_type(t: int) -> float:
+    lo, hi = speed_range_for_type(t)
+    return random.uniform(lo, hi)
+
 # 地球半径
 EARTH_R = 6371000.0
 
@@ -134,6 +152,19 @@ class SimTarget:
         self.intensity = intensity_db
         # 内部相位用于平滑起伏
         self._phase = random.uniform(0.0, 6.28318)
+        # 根据类型决定速度上下限，便于后续 step 中约束
+        def _speed_range_for_type(t: int):
+            # 返回 (min, max) m/s
+            mapping = {
+                0: (0.0, 400.0),
+                1: (0.0, 25.0),
+                2: (10.0, 60.0),
+                3: (30.0, 120.0),
+                4: (10.0, 80.0),
+                5: (100.0, 250.0),
+            }
+            return mapping.get(t, (0.0, 400.0))
+        self._speed_min, self._speed_max = _speed_range_for_type(self.target_type)
 
     def step(self, dt: float, center_lat: float, center_lon: float, leash_m: float):
         """不规则运动：随机游走 + 超出半径时朝中心回摆，保持高度轻微起伏。
@@ -141,9 +172,22 @@ class SimTarget:
         - center_*: 雷达中心经纬
         - leash_m: 目标允许离中心的最大半径（米）
         """
-        # 速度轻微扰动并限幅
-        self.speed += random.uniform(-0.8, 0.8) * max(dt, 0.05)
-        self.speed = clamp(self.speed, 3.0, 25.0)
+        # 速度轻微扰动并限幅：扰动幅度与类型相关（无人机更小，飞机更大）
+        type_scale = 1.0
+        if self.target_type == 1:
+            type_scale = 0.4
+        elif self.target_type == 2:
+            type_scale = 0.8
+        elif self.target_type == 3:
+            type_scale = 1.5
+        elif self.target_type == 4:
+            type_scale = 1.0
+        elif self.target_type == 5:
+            type_scale = 2.0
+
+        self.speed += random.uniform(-0.8, 0.8) * max(dt, 0.05) * type_scale
+        # 最小速度不应小于0，且尊重类型定义的上下限
+        self.speed = clamp(self.speed, max(0.0, self._speed_min), self._speed_max)
 
         # 当前到中心的方位与距离（从目标->中心）
         brg_to_center, dist_to_center = bearing_distance(self.lat, self.lon, center_lat, center_lon)
@@ -265,15 +309,17 @@ class RadarSimulator:
                 # initial heading: point toward radar center with small jitter
                 heading_to_center = bearing_distance(lat, lon, self.radar_lat, self.radar_lon)[0]
                 init_heading = normalize_angle_deg(heading_to_center + random.uniform(-10.0, 10.0))
+                ttype = random.choice([0x00, 0x01, 0x02, 0x03, 0x04, 0x05])
+                init_speed = sample_speed_for_type(ttype)
                 self.targets.append(
                     SimTarget(
                         track_id=i + 1,
                         lat=lat,
                         lon=lon,
                         alt_m=self.radar_alt + 100.0 + random.uniform(-5.0, 5.0) + 5.0 * i,
-                        speed_mps=12.0 + (i % 3) * 3.0 + random.uniform(-2.0, 2.0),
+                        speed_mps=init_speed,
                         heading_deg=init_heading,
-                        target_type=random.choice([0x00, 0x01, 0x02, 0x03, 0x04, 0x05]),
+                        target_type=ttype,
                         size=random.choice([0x00, 0x01, 0x02, 0x03]),
                         intensity_db=25.0,
                     )
