@@ -856,6 +856,42 @@ class RadarSimulator:
                         pkt = self._build_status_packet()
                         self.sock.sendto(pkt, addr)
                     # 其他查询可在此扩展
+            # 0x4444: 导弹击中目标通知报文
+            elif msg_id == 0x4444:
+                # 报文体格式：frame_head_t 已在前32B解析，body 为 data[32:-2]
+                # body: uint8 target_id, uint8[16] reserved
+                self.logger.debug(f'MISSILE HIT body len={len(body)} from {addr} data={body.hex()}')
+                if len(body) < 1:
+                    self.logger.warning(f'SHORT MISSILE HIT body from {addr}, len={len(body)}')
+                    self._send_ack(msg_id, addr, seq, result=0)
+                    continue
+
+                target_id = body[0]
+                removed = False
+                with self.lock:
+                    # find and remove target(s) with matching track_id (track_id stored as int)
+                    new_targets = []
+                    for t in self.targets:
+                        if t.track_id == target_id:
+                            removed = True
+                            self.logger.info(f'Target hit: removing track_id={t.track_id}')
+                            # do not append, effectively removing
+                        else:
+                            new_targets.append(t)
+                    # if removed, append a newly spawned target to keep count stable
+                    if removed:
+                        nt = self._create_new_target()
+                        new_targets.append(nt)
+                        self.logger.info(f'New target spawned track_id={nt.track_id} replacing hit target')
+                        self.targets = new_targets
+
+                # 回应 ACK 表示已处理
+                if removed:
+                    self._send_ack(msg_id, addr, seq, result=1)
+                else:
+                    self.logger.warning(f'Missile hit referenced unknown track_id={target_id} from {addr}')
+                    self._send_ack(msg_id, addr, seq, result=0)
+
             else:
                 # 未覆盖的指令，做一个收到但未处理的ACK
                 self._send_ack(msg_id, addr, seq, result=0)
